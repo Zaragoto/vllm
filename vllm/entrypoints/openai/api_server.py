@@ -268,54 +268,47 @@ async def validate_json_request(raw_request: Request):
 
 router = APIRouter()
 
-# Transform 'prefix-(a,b)' -> 'prefix-a'
-_id_re = re.compile(r"^(.+?)-\(([^,]+),[^)]*\)$")
+_id_pattern = re.compile(r"^(.+?)-\(([^,]+),[^)]*\)$")
 
-def transform_id(val: str) -> str:
-    if not isinstance(val, str):
-        return val
-    m = _id_re.match(val)
-    return f"{m.group(1)}-{m.group(2)}" if m else val
+def strip_id(value: str) -> str:
+    if not isinstance(value, str):
+        return value
+    m = _id_pattern.match(value)
+    return f"{m.group(1)}-{m.group(2)}" if m else value
 
-def walk_and_fix_ids(obj: Any) -> None:
-    if isinstance(obj, dict):
-        for k, v in obj.items():
+def rewrite_ids(node: Any) -> None:
+    if isinstance(node, dict):
+        for k, v in node.items():
             if k == "id" and isinstance(v, str):
-                obj[k] = transform_id(v)
+                node[k] = strip_id(v)
             else:
-                walk_and_fix_ids(v)
-    elif isinstance(obj, list):
-        for it in obj:
-            walk_and_fix_ids(it)
+                rewrite_ids(v)
+    elif isinstance(node, list):
+        for item in node:
+            rewrite_ids(item)
 
-
-async def rewrite_json_bytes(content: bytes) -> bytes:
+async def patch_json(body: bytes) -> bytes:
     try:
-        data = json.loads(content.decode("utf-8"))
+        data = json.loads(body.decode("utf-8"))
     except Exception:
-        return content
-    walk_and_fix_ids(data)
+        return body
+    rewrite_ids(data)
     return json.dumps(data, ensure_ascii=False).encode("utf-8")
 
-
-async def rewrite_sse_chunk(chunk: bytes) -> bytes:
+async def patch_sse(chunk: bytes) -> bytes:
     try:
         text = chunk.decode("utf-8")
     except UnicodeDecodeError:
         return chunk
     if not text.startswith("data: "):
         return chunk
-    payload = text[6:]
     try:
-        data = json.loads(payload)
+        data = json.loads(text[6:])
     except Exception:
         return chunk
-    walk_and_fix_ids(data)
-    new_payload = json.dumps(data, ensure_ascii=False)
-    return f"data: {new_payload}\n\n".encode("utf-8")
-
-class IdRewriteASGIMiddleware:
-
+    rewrite_ids(data)
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
+class IdRewriteMiddleware:
     def __init__(self, app: ASGIApp, paths: list[str]):
         self.app = app
         self.paths = set(paths)
@@ -324,85 +317,63 @@ class IdRewriteASGIMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-
         raw_path = scope.get("path", "")
         root = scope.get("root_path", "") or ""
-        path = raw_path[len(root) :] if root and raw_path.startswith(root) else raw_path
-
+        path = raw_path[len(root):] if root and raw_path.startswith(root) else raw_path
         if path not in self.paths:
             await self.app(scope, receive, send)
             return
+        state = {"st": None, "hdrs": None, "ctype": "", "sse": False, "started": False, "buf": []}
 
-        state = {
-            "status": None,
-            "headers": None,
-            "content_type": "",
-            "is_sse": False,
-            "started": False,
-            "chunks": [],
-        }
-
-        async def send_wrap(message: Message):
-            typ = message["type"]
-
-            if typ == "http.response.start":
-                state["status"] = message["status"]
-                raw_headers = message.get("headers", [])
-                headers = []
-                ctype = ""
-                for k, v in raw_headers:
-                    kn = k.decode("latin1").lower()
-                    vv = v.decode("latin1")
-                    if kn == "content-type":
-                        ctype = vv.lower()
-                    # drop content-length to avoid mismatch
-                    if kn == "content-length":
+        async def send_proxy(message: Message):
+            t = message["type"]
+            if t == "http.response.start":
+                state["st"] = message["status"]
+                hdrs, ctype = [], ""
+                for k, v in message.get("headers", []):
+                    k_s = k.decode("latin1").lower()
+                    v_s = v.decode("latin1")
+                    if k_s == "content-type":
+                        ctype = v_s.lower()
+                    if k_s == "content-length":
                         continue
-                    headers.append((k, v))
-                state["headers"] = headers
-                state["content_type"] = ctype
-                state["is_sse"] = "text/event-stream" in ctype
-                # delay sending start until first body
+                    hdrs.append((k, v))
+                state["hdrs"], state["ctype"], state["sse"] = hdrs, ctype, "text/event-stream" in ctype
                 return
 
-            if typ == "http.response.body":
+            if t == "http.response.body":
                 body = message.get("body", b"")
                 more = message.get("more_body", False)
-
-                if state["is_sse"]:
+                if state["sse"]:
                     if not state["started"]:
-                        await send({"type": "http.response.start", "status": state["status"], "headers": state["headers"]})
+                        await send({"type": "http.response.start", "status": state["st"], "headers": state["hdrs"]})
                         state["started"] = True
                     if body:
                         try:
-                            body = await rewrite_sse_chunk(body)
+                            body = await patch_sse(body)
                         except Exception:
                             pass
                     await send({"type": "http.response.body", "body": body, "more_body": more})
                     return
 
-                # non-sse: collect and handle at end
-                state["chunks"].append(body)
+                state["buf"].append(body)
                 if more:
                     return
-
-                full = b"".join(state["chunks"])
-                if "json" in state["content_type"]:
+                full = b"".join(state["buf"])
+                if "json" in state["ctype"]:
                     try:
-                        full = await rewrite_json_bytes(full)
+                        full = await patch_json(full)
                     except Exception:
                         pass
 
                 if not state["started"]:
-                    await send({"type": "http.response.start", "status": state["status"], "headers": state["headers"]})
+                    await send({"type": "http.response.start", "status": state["st"], "headers": state["hdrs"]})
                     state["started"] = True
-
                 await send({"type": "http.response.body", "body": full, "more_body": False})
                 return
-
             await send(message)
 
-        await self.app(scope, receive, send_wrap)
+        await self.app(scope, receive, send_proxy)
 
 
 class PrometheusResponse(Response):
