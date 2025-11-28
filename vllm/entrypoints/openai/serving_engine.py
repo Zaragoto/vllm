@@ -1343,14 +1343,17 @@ class OpenAIServing:
     @staticmethod
     def _base_request_id(
         raw_request: Request | None, default: str | None = None
-    ) -> str | None:
-        """Pulls the request id to use from a header, if provided"""
-        if raw_request is not None and (
-            (req_id := raw_request.headers.get("X-Request-Id")) is not None
-        ):
-            return req_id
-
-        return random_uuid() if default is None else default
+    ) -> str:
+        """ Generates a base request ID as the composition of raw_request ID
+        and a default random UUID. with its format as (raw_request ID, UUID).
+        If raw_request is None, use only the default random UUID for both parts."""
+        
+        default = default or random_uuid()
+        if raw_request is None:
+            return f"({default},{default})"
+        else:
+            header_id = raw_request.headers.get("X-Request-Id", default)
+            return f"({header_id},{default})"
 
     @staticmethod
     def _get_data_parallel_rank(raw_request: Request | None) -> int | None:

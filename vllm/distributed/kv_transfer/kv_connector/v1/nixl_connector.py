@@ -107,6 +107,7 @@ class NixlAgentMetadata(KVConnectorHandshakeMetadata):
     attn_backend_name: str
     kv_cache_layout: str
     block_size: int
+    remote_request_id: str
 
 
 @dataclass
@@ -148,6 +149,7 @@ class NixlConnectorMetadata(KVConnectorMetadata):
             remote_port=kv_transfer_params["remote_port"],
             # P workers don't need to receive tp_size from proxy here.
             tp_size=kv_transfer_params.get("tp_size", 1),
+            remote_request_id=kv_transfer_params.get("remote_request_id", ""),
         )
         if save_to_host:
             self.reqs_to_save[request_id] = _req
@@ -662,6 +664,7 @@ class NixlConnectorScheduler:
             remote_host=self.side_channel_host,
             remote_port=self.side_channel_port,
             tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
+            remote_request_id=request.request_id,
         )
 
 
@@ -1948,6 +1951,7 @@ class NixlConnectorWorker:
             dst_engine_id=meta.remote_engine_id,
             local_block_ids=meta.local_physical_block_ids,
             remote_block_ids=meta.remote_block_ids,
+            remote_request_id=meta.remote_request_id,
         )
 
     def _read_blocks(
@@ -1956,6 +1960,7 @@ class NixlConnectorWorker:
         remote_block_ids: list[int],
         dst_engine_id: str,
         request_id: str,
+        remote_request_id: str,
     ):
         block_size_ratio = self.kv_topo.block_size_ratio_from_engine_id(dst_engine_id)
         if block_size_ratio > 1:
@@ -1988,7 +1993,7 @@ class NixlConnectorWorker:
         # Number of D TP workers that will read from dst P. Propagate tp_ratio
         # on notification so that dst worker can wait before freeing blocks.
         tp_ratio = self.kv_topo.tp_ratio_from_engine_id(dst_engine_id)
-        notif_id = f"{request_id}:{tp_ratio}".encode()
+        notif_id = f"{remote_request_id}:{tp_ratio}".encode()
 
         # Full prefix cache hit: do not need to read remote blocks,
         # just notify P worker that we have the blocks we need.
@@ -2005,7 +2010,7 @@ class NixlConnectorWorker:
                     "NIXL send_notif failed for request %s: "
                     "P worker blocks will be freed after timeout. "
                     "This may indicate network issues.",
-                    request_id,
+                    remote_request_id,
                 )
                 self.xfer_stats.record_failed_notification()
             return
