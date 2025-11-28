@@ -126,6 +126,8 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.prometheus import get_prometheus_registry
 from vllm.version import __version__ as VLLM_VERSION
 
+from starlette.types import ASGIApp, Receive, Scope, Send, Message
+
 prometheus_multiproc_dir: tempfile.TemporaryDirectory
 
 # Cannot use __name__ (https://github.com/vllm-project/vllm/pull/4765)
@@ -266,95 +268,68 @@ async def validate_json_request(raw_request: Request):
 
 router = APIRouter()
 
-# regex matching 'prefix-(client_req_id, internal_req_id)' format
-def transform_id(original_id: str) -> str:
-    """transform 'prefix-(id1,id2)' to 'prefix-id1'."""
-    if not isinstance(original_id, str):
-        return original_id
+# Transform 'prefix-(a,b)' -> 'prefix-a'
+_id_re = re.compile(r"^(.+?)-\(([^,]+),[^)]*\)$")
 
-    pattern = r'^(.+?)-\(([^,]+),[^)]*\)$'
-    match = re.match(pattern, original_id)
-    if match:
-        prefix, first_id = match.groups()
-        return f"{prefix}-{first_id}"
-    return original_id
+def transform_id(val: str) -> str:
+    if not isinstance(val, str):
+        return val
+    m = _id_re.match(val)
+    return f"{m.group(1)}-{m.group(2)}" if m else val
 
-
-def _modify_ids_in_obj(obj: Any):
-    """change all id fields in a nested JSON-like object iteratively."""
+def walk_and_fix_ids(obj: Any) -> None:
     if isinstance(obj, dict):
         for k, v in obj.items():
             if k == "id" and isinstance(v, str):
                 obj[k] = transform_id(v)
             else:
-                _modify_ids_in_obj(v)
+                walk_and_fix_ids(v)
     elif isinstance(obj, list):
-        for item in obj:
-            _modify_ids_in_obj(item)
+        for it in obj:
+            walk_and_fix_ids(it)
 
 
-async def modify_json_bytes(content: bytes) -> bytes:
-    """modify all id fields in JSON bytes, return original on failure."""
+async def rewrite_json_bytes(content: bytes) -> bytes:
     try:
         data = json.loads(content.decode("utf-8"))
     except Exception:
         return content
-
-    _modify_ids_in_obj(data)
+    walk_and_fix_ids(data)
     return json.dumps(data, ensure_ascii=False).encode("utf-8")
 
 
-async def modify_sse_chunk(chunk: bytes) -> bytes:
-    """
-    modify a single SSE data chunk's JSON payload id fields.
-    Only process a single line JSON format that starts with 'data: '.
-    """
+async def rewrite_sse_chunk(chunk: bytes) -> bytes:
     try:
         text = chunk.decode("utf-8")
     except UnicodeDecodeError:
         return chunk
-
     if not text.startswith("data: "):
         return chunk
-
-    payload = text[6:]  # remove 'data: '
+    payload = text[6:]
     try:
         data = json.loads(payload)
     except Exception:
         return chunk
-
-    _modify_ids_in_obj(data)
+    walk_and_fix_ids(data)
     new_payload = json.dumps(data, ensure_ascii=False)
     return f"data: {new_payload}\n\n".encode("utf-8")
 
-from starlette.types import ASGIApp, Receive, Scope, Send, Message
-
 class IdRewriteASGIMiddleware:
-    """
-    Unified modification of id fields in multiple API responses at the ASGI layer: 
-    - Supports application/json: aggregates all body, modifies ids, and resends;
-    - Supports text/event-stream: modifies ids in each SSE chunk;
-    - Limits processing to specified `paths` (exact match or startswith as needed).
-    """
 
     def __init__(self, app: ASGIApp, paths: list[str]):
         self.app = app
-        self.paths = paths
+        self.paths = set(paths)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send):
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
-        path = scope.get("path", "")
-        root_path = scope.get("root_path", "") or ""
-        if root_path and path.startswith(root_path):
-            path_ = path[len(root_path):]
-        else:
-            path_ = path
+        raw_path = scope.get("path", "")
+        root = scope.get("root_path", "") or ""
+        path = raw_path[len(root) :] if root and raw_path.startswith(root) else raw_path
 
-        # only process configured paths; one can use exact match or startswith as needed
-        if path_ not in self.paths:
+        if path not in self.paths:
             await self.app(scope, receive, send)
             return
 
@@ -364,96 +339,70 @@ class IdRewriteASGIMiddleware:
             "content_type": "",
             "is_sse": False,
             "started": False,
-            "body_chunks": [],
+            "chunks": [],
         }
 
-        async def send_wrapper(message: Message):
-            msg_type = message["type"]
+        async def send_wrap(message: Message):
+            typ = message["type"]
 
-            if msg_type == "http.response.start":
+            if typ == "http.response.start":
                 state["status"] = message["status"]
                 raw_headers = message.get("headers", [])
-                new_headers = []
-                content_type = ""
-
+                headers = []
+                ctype = ""
                 for k, v in raw_headers:
-                    k_str = k.decode("latin1").lower()
-                    v_str = v.decode("latin1")
-                    if k_str == "content-type":
-                        content_type = v_str.lower()
-                    # remove content-length to prevent length mismatch; let server send as chunked
-                    if k_str == "content-length":
+                    kn = k.decode("latin1").lower()
+                    vv = v.decode("latin1")
+                    if kn == "content-type":
+                        ctype = vv.lower()
+                    # drop content-length to avoid mismatch
+                    if kn == "content-length":
                         continue
-                    new_headers.append((k, v))
-
-                state["headers"] = new_headers
-                state["content_type"] = content_type
-                state["is_sse"] = "text/event-stream" in content_type
-                # do not send start yet; wait for first body chunk (we may modify body)
+                    headers.append((k, v))
+                state["headers"] = headers
+                state["content_type"] = ctype
+                state["is_sse"] = "text/event-stream" in ctype
+                # delay sending start until first body
                 return
 
-            if msg_type == "http.response.body":
+            if typ == "http.response.body":
                 body = message.get("body", b"")
-                more_body = message.get("more_body", False)
+                more = message.get("more_body", False)
 
-                # 1) SSE stream: modify each chunk and pass through
                 if state["is_sse"]:
                     if not state["started"]:
-                        await send({
-                            "type": "http.response.start",
-                            "status": state["status"],
-                            "headers": state["headers"],
-                        })
+                        await send({"type": "http.response.start", "status": state["status"], "headers": state["headers"]})
                         state["started"] = True
-
                     if body:
                         try:
-                            body = await modify_sse_chunk(body)
+                            body = await rewrite_sse_chunk(body)
                         except Exception:
                             pass
-
-                    await send({
-                        "type": "http.response.body",
-                        "body": body,
-                        "more_body": more_body,
-                    })
+                    await send({"type": "http.response.body", "body": body, "more_body": more})
                     return
 
-                # 2) Non-SSE: if JSON, aggregate all body chunks and modify at the end
-                state["body_chunks"].append(body)
-
-                if more_body:
-                    # not the last chunk yet
+                # non-sse: collect and handle at end
+                state["chunks"].append(body)
+                if more:
                     return
 
-                full_body = b"".join(state["body_chunks"])
-
-                # only modify JSON (Content-Type includes json)
+                full = b"".join(state["chunks"])
                 if "json" in state["content_type"]:
                     try:
-                        full_body = await modify_json_bytes(full_body)
+                        full = await rewrite_json_bytes(full)
                     except Exception:
                         pass
 
                 if not state["started"]:
-                    await send({
-                        "type": "http.response.start",
-                        "status": state["status"],
-                        "headers": state["headers"],
-                    })
+                    await send({"type": "http.response.start", "status": state["status"], "headers": state["headers"]})
                     state["started"] = True
 
-                await send({
-                    "type": "http.response.body",
-                    "body": full_body,
-                    "more_body": False,
-                })
+                await send({"type": "http.response.body", "body": full, "more_body": False})
                 return
 
-            # other messages (e.g., http.response.trailers) are passed through as is
             await send(message)
 
-        await self.app(scope, receive, send_wrapper)
+        await self.app(scope, receive, send_wrap)
 
 
 class PrometheusResponse(Response):
